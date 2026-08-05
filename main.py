@@ -162,6 +162,16 @@ def db():
     # سجل ما نُشر فعلاً لمنع تكرار نفس الخبر في القناة
     con.execute("""CREATE TABLE IF NOT EXISTS pushed(
         key TEXT PRIMARY KEY, created TEXT)""")
+    # زوار البوت: كل من فتح البوت أو تفاعل معه مرة واحدة على الأقل
+    con.execute("""CREATE TABLE IF NOT EXISTS users(
+        chat_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, lang TEXT,
+        joined TEXT, last_seen TEXT, hits INTEGER DEFAULT 0)""")
+    # طابور النشر داخل جدول news:
+    # sent = 0 في الانتظار · 1 نُشر · 2 مكرر متروك
+    try:
+        con.execute("ALTER TABLE news ADD COLUMN sent INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     con.commit()
     return con
 
@@ -181,25 +191,85 @@ def save_news(link, title, source, origin, category):
 
 # ---------- منع تكرار النشر ----------
 def norm_key(title: str) -> str:
-    """مفتاح مُطبَّع للعنوان: يكشف الخبر نفسه ولو جاء من موقع عربي آخر."""
+    """يُعيد كلمات العنوان بعد التطبيع (حذف التشكيل وتوحيد الحروف)."""
     s = re.sub(r"[ً-ْـ]", "", title or "")
     for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ى", "ي"), ("ة", "ه")):
         s = s.replace(a, b)
     s = re.sub(r"[^\w؀-ۿ ]+", " ", s).lower()
-    words = sorted({w for w in s.split() if len(w) > 2})[:8]
-    return " ".join(words)
+    return [w for w in s.split() if len(w) > 2]
+
+
+STOP = {"من", "في", "على", "علي", "عن", "الي", "مع", "بعد", "قبل", "هذا",
+        "هذه", "التي", "الذي", "بين", "كل", "دولار", "اليوم", "خلال",
+        "the", "and", "for", "with", "from", "this", "that"}
+
+
+def keys_for(title: str, link: str):
+    """مفتاحان لكل خبر: مجموعة الكلمات المرتّبة + أول 5 كلمات مهمة."""
+    words = [w for w in norm_key(title) if w not in STOP]
+    if len(words) < 3:
+        return ["L:" + link]
+    return ["A:" + " ".join(sorted(set(words))[:8]),
+            "B:" + " ".join(words[:5])]
 
 
 def mark_pushed(title: str, link: str) -> bool:
-    """True إذا كان الخبر جديدًا فعلاً، False إذا نُشر سابقًا."""
-    key = norm_key(title) or link
-    try:
-        CON.execute("INSERT INTO pushed VALUES (?,?)",
-                    (key, datetime.now(timezone.utc).isoformat()))
-        CON.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    """True إذا كان الخبر جديدًا فعلاً، False إذا نُشر سابقًا أو نُشرت نسخة منه."""
+    keys = keys_for(title, link)
+    now = datetime.now(timezone.utc).isoformat()
+    for k in keys:
+        if CON.execute("SELECT 1 FROM pushed WHERE key = ?", (k,)).fetchone():
+            return False
+    for k in keys:
+        try:
+            CON.execute("INSERT INTO pushed VALUES (?,?)", (k, now))
+        except sqlite3.IntegrityError:
+            pass
+    CON.commit()
+    return True
+
+
+# ---------- طابور النشر: خبر واحد كل دورة ----------
+def queue_size() -> int:
+    return CON.execute("SELECT COUNT(*) FROM news WHERE sent = 0").fetchone()[0]
+
+
+def next_unsent():
+    """أقدم خبر لم يُنشر بعد، مع تخطّي أي نسخة مكررة."""
+    rows = CON.execute(
+        "SELECT link, title, source, origin, category FROM news "
+        "WHERE sent = 0 ORDER BY created ASC").fetchall()
+    for link, title, source, origin, category in rows:
+        if not mark_pushed(title, link):
+            CON.execute("UPDATE news SET sent = 2 WHERE link = ?", (link,))
+            CON.commit()
+            continue
+        return {"link": link, "title": title, "source": source,
+                "origin": origin, "category": category}
+    return None
+
+
+def mark_sent(link: str):
+    CON.execute("UPDATE news SET sent = 1 WHERE link = ?", (link,))
+    CON.commit()
+
+
+# ---------- زوار البوت ----------
+def touch_user(update):
+    """يسجّل كل من يفتح البوت أو يضغط زرًا (زائر + عدد التفاعلات)."""
+    u = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
+    if not u or not chat:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    CON.execute(
+        "INSERT INTO users(chat_id,username,first_name,lang,joined,last_seen,hits) "
+        "VALUES (?,?,?,?,?,?,1) ON CONFLICT(chat_id) DO UPDATE SET "
+        "last_seen = excluded.last_seen, hits = hits + 1, "
+        "username = excluded.username, first_name = excluded.first_name",
+        (chat.id, u.username or "", u.first_name or "",
+         (u.language_code or "")[:5], now, now))
+    CON.commit()
 
 
 def latest(limit=50, category=None, origin=None):
@@ -350,7 +420,7 @@ def t(key, lang, **kw):
     return s.format(**kw) if kw else s
 
 
-def main_kb(lang):
+def main_kb(lang, chat_id=None):
     rows = []
     if WEBAPP_URL:
         rows.append([InlineKeyboardButton(
@@ -361,20 +431,25 @@ def main_kb(lang):
     rows.append([InlineKeyboardButton(t("x_news", lang), callback_data="c:x")])
     rows.append([InlineKeyboardButton(FLAGS[l], callback_data="l:" + l)
                  for l in LANGS])
+    # زر الإحصاءات يظهر لك أنت فقط
+    if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
+        rows.append([InlineKeyboardButton("📊 الإحصاءات", callback_data="s:stats")])
     return InlineKeyboardMarkup(rows)
 
 
 # ==================== الأوامر ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user(update)
     chat = update.effective_chat.id
     code = (update.effective_user.language_code or DEFAULT_LANG)[:2]
     lang = code if code in LANGS else DEFAULT_LANG
     set_lang(chat, lang)
     await update.message.reply_text(
-        t("welcome", lang, m=INTERVAL_MINUTES), reply_markup=main_kb(lang))
+        t("welcome", lang, m=INTERVAL_MINUTES), reply_markup=main_kb(lang, chat))
 
 
 async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user(update)
     lang = get_lang(update.effective_chat.id)
     await update.message.reply_text(
         "🌍 " + " / ".join(FLAGS.values()),
@@ -400,15 +475,19 @@ async def show(update_or_q, lang, category=None, origin=None):
 
 
 async def mining_cmd(u, c):
+    touch_user(u)
     await show(u, get_lang(u.effective_chat.id), CAT_MINING)
 
 async def trading_cmd(u, c):
+    touch_user(u)
     await show(u, get_lang(u.effective_chat.id), CAT_TRADING)
 
 async def x_cmd(u, c):
+    touch_user(u)
     await show(u, get_lang(u.effective_chat.id), None, "x")
 
 async def latest_cmd(u, c):
+    touch_user(u)
     await show(u, get_lang(u.effective_chat.id))
 
 
@@ -446,8 +525,56 @@ def stats_text(hours=24):
             "🌐 إجمالي المستخدمين (كل الوقت): <b>" + str(all_users) + "</b>")
 
 
+def bot_stats_text(hours=24):
+    """إحصاءات زوار البوت والنشر والطابور."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    total = CON.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    new_users = CON.execute(
+        "SELECT COUNT(*) FROM users WHERE joined >= ?", (since,)).fetchone()[0]
+    active = CON.execute(
+        "SELECT COUNT(*) FROM users WHERE last_seen >= ?", (since,)).fetchone()[0]
+    subs = CON.execute("SELECT COUNT(*) FROM subs").fetchone()[0]
+    hits = CON.execute("SELECT COALESCE(SUM(hits),0) FROM users").fetchone()[0]
+    sent = CON.execute("SELECT COUNT(*) FROM news WHERE sent = 1").fetchone()[0]
+    sent_p = CON.execute(
+        "SELECT COUNT(*) FROM news WHERE sent = 1 AND created >= ?",
+        (since,)).fetchone()[0]
+    dups = CON.execute("SELECT COUNT(*) FROM news WHERE sent = 2").fetchone()[0]
+    langs = CON.execute(
+        "SELECT lang, COUNT(*) FROM subs GROUP BY lang ORDER BY 2 DESC").fetchall()
+    langs_txt = " · ".join((l or "?") + ": " + str(c) for l, c in langs) or "—"
+    return ("👥 <b>إحصاءات البوت — آخر " + str(hours) + " ساعة</b>\n\n"
+            "🚪 إجمالي زوار البوت: <b>" + str(total) + "</b>\n"
+            "🆕 زوار جدد: <b>" + str(new_users) + "</b>\n"
+            "🟢 نشطون: <b>" + str(active) + "</b>\n"
+            "🔔 مشتركون حاليًا: <b>" + str(subs) + "</b>\n"
+            "🖐️ إجمالي التفاعلات: <b>" + str(hits) + "</b>\n"
+            "🌍 لغات المشتركين: " + langs_txt + "\n\n"
+            "📨 أخبار منشورة (كل الوقت): <b>" + str(sent) + "</b>\n"
+            "📅 منشورة خلال الفترة: <b>" + str(sent_p) + "</b>\n"
+            "⏳ في طابور الانتظار: <b>" + str(queue_size()) + "</b>\n"
+            "🚫 مكررات مُستبعدة: <b>" + str(dups) + "</b>")
+
+
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(stats_text(24), parse_mode=ParseMode.HTML)
+    touch_user(update)
+    await update.message.reply_text(
+        bot_stats_text(24) + "\n\n" + stats_text(24), parse_mode=ParseMode.HTML)
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قائمة بآخر الزوار."""
+    touch_user(update)
+    rows = CON.execute(
+        "SELECT username, first_name, lang, hits, last_seen FROM users "
+        "ORDER BY last_seen DESC LIMIT 20").fetchall()
+    lines = ["👥 <b>آخر 20 زائرًا</b>"]
+    for un, fn, lg, h, ls in rows:
+        name = ("@" + un) if un else (fn or "مستخدم")
+        lines.append("• " + name + " · " + (lg or "?") + " · "
+                     + str(h) + " تفاعل · " + (ls or "")[:16].replace("T", " "))
+    await update.message.reply_text("\n".join(lines),
+                                    parse_mode=ParseMode.HTML)
 
 
 async def job_stats(context: ContextTypes.DEFAULT_TYPE):
@@ -459,8 +586,9 @@ async def job_stats(context: ContextTypes.DEFAULT_TYPE):
     if not target:
         return
     try:
-        await context.bot.send_message(target, "🔔 " + stats_text(24),
-                                       parse_mode=ParseMode.HTML)
+        await context.bot.send_message(
+            target, "🔔 " + bot_stats_text(24) + "\n\n" + stats_text(24),
+            parse_mode=ParseMode.HTML)
     except Exception as err:
         print("stats error:", err)
 
@@ -468,12 +596,21 @@ async def job_stats(context: ContextTypes.DEFAULT_TYPE):
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    touch_user(update)
     chat = q.message.chat_id
     data = q.data or ""
     if data.startswith("l:"):
         lang = data[2:]
         set_lang(chat, lang)
-        await q.message.reply_text(t("lang_set", lang), reply_markup=main_kb(lang))
+        await q.message.reply_text(t("lang_set", lang),
+                                   reply_markup=main_kb(lang, chat))
+        return
+    if data == "s:stats":
+        if ADMIN_CHAT_ID and str(chat) != str(ADMIN_CHAT_ID):
+            return
+        await q.message.reply_text(
+            bot_stats_text(24) + "\n\n" + stats_text(24),
+            parse_mode=ParseMode.HTML)
         return
     lang = get_lang(chat)
     key = data[2:]
@@ -485,39 +622,40 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== الدورة التلقائية ====================
 async def job_push(context: ContextTypes.DEFAULT_TYPE):
-    fresh = await asyncio.to_thread(collect_all)
-    if not fresh:
+    """دورة كل 15 دقيقة: تجمع الأخبار ثم تنشر **خبرًا واحدًا فقط**.
+    إن لم يوجد خبر جديد لا تُرسل أي شيء."""
+    await asyncio.to_thread(collect_all)      # جمع فقط → يُخزن في الطابور
+    item = next_unsent()
+    if item is None:
+        print("لا يوجد خبر جديد — لن يُرسل شيء في هذه الدورة")
         return
-    subs = CON.execute("SELECT chat_id, lang FROM subs").fetchall()
-    for item in fresh[:8]:
-        # لا تُنشر خبرًا نُشر سابقًا (ولو ورد من مصدر عربي آخر برابط مختلف)
-        if not mark_pushed(item["title"], item["link"]):
-            continue
-        for chat_id, lang in subs:
-            lang = lang if lang in LANGS else DEFAULT_LANG
-            title = await asyncio.to_thread(translate, item["title"], lang)
-            tag = "🐦 X" if item["origin"] == "x" else "📰"
-            msg = (tag + "\n\n<b>" + title + "</b>\n<i>" + item["source"]
-                   + "</i>\n" + item["link"])
-            try:
-                await context.bot.send_message(chat_id, msg,
-                                               parse_mode=ParseMode.HTML)
-            except Exception as err:
-                print("send error:", chat_id, err)
-            await asyncio.sleep(0.4)
-        if CHANNEL_ID:
-            try:
-                # القناة تُنشر بلغة CHANNEL_LANG (العربية افتراضيًا)
-                ch_title = await asyncio.to_thread(
-                    translate, item["title"], CHANNEL_LANG)
-                tag = ("🐦 X" if item["origin"] == "x"
-                       else "▶️ يوتيوب" if item["origin"] == "yt" else "📰")
-                await context.bot.send_message(
-                    CHANNEL_ID,
-                    tag + "\n\n<b>" + ch_title + "</b>\n<i>" + item["source"]
-                    + "</i>\n" + item["link"], parse_mode=ParseMode.HTML)
-            except Exception as err:
-                print("channel error:", err)
+    tag = ("🐦 X" if item["origin"] == "x"
+           else "▶️ يوتيوب" if item["origin"] == "yt" else "📰")
+    # 1) القناة — دائمًا بلغة CHANNEL_LANG (العربية)
+    if CHANNEL_ID:
+        try:
+            ch_title = await asyncio.to_thread(
+                translate, item["title"], CHANNEL_LANG)
+            await context.bot.send_message(
+                CHANNEL_ID,
+                tag + "\n\n<b>" + ch_title + "</b>\n<i>" + item["source"]
+                + "</i>\n" + item["link"], parse_mode=ParseMode.HTML)
+        except Exception as err:
+            print("channel error:", err)
+    # 2) المشتركون كلّ بلغته
+    for chat_id, lang in CON.execute("SELECT chat_id, lang FROM subs").fetchall():
+        lang = lang if lang in LANGS else DEFAULT_LANG
+        title = await asyncio.to_thread(translate, item["title"], lang)
+        try:
+            await context.bot.send_message(
+                chat_id,
+                tag + "\n\n<b>" + title + "</b>\n<i>" + item["source"]
+                + "</i>\n" + item["link"], parse_mode=ParseMode.HTML)
+        except Exception as err:
+            print("send error:", chat_id, err)
+        await asyncio.sleep(0.4)
+    mark_sent(item["link"])
+    print("نُشر خبر واحد · المتبقّي في الطابور:", queue_size())
 
 
 # ==================== خادم الـ Mini App ====================
@@ -601,6 +739,7 @@ def main():
     app.add_handler(CommandHandler("latest", latest_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
 
     app.job_queue.run_repeating(job_push, interval=INTERVAL_MINUTES * 60, first=10)
