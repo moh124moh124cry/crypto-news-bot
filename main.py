@@ -6,10 +6,10 @@ import asyncio
 import threading
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 import feedparser
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
@@ -24,6 +24,16 @@ WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "3"))
 X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "news.db")
+
+# لغة النشر في القناة (مستقلة عن لغة كل مستخدم)
+CHANNEL_LANG = os.environ.get("CHANNEL_LANG", "ar")
+# محادثتك الشخصية لاستقبال منبّه الإحصاءات (رقم من @userinfobot)
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+# ساعة المنبّه اليومي بتوقيت UTC (21 = 22:00 بتوقيت الجزائر)
+STATS_HOUR_UTC = int(os.environ.get("STATS_HOUR_UTC", "21"))
+# قنوات يوتيوب: معرّفات تبدأ بـ UC... مفصولة بفواصل
+YOUTUBE_CHANNEL_IDS = [c.strip() for c in
+                       os.environ.get("YOUTUBE_CHANNEL_IDS", "").split(",") if c.strip()]
 
 LANGS = ["ar", "en", "fr", "de", "es"]
 DEFAULT_LANG = os.environ.get("DEFAULT_LANG", "ar")
@@ -127,6 +137,9 @@ def db():
         category TEXT, created TEXT)""")
     con.execute("""CREATE TABLE IF NOT EXISTS subs(
         chat_id INTEGER PRIMARY KEY, lang TEXT DEFAULT 'ar')""")
+    con.execute("""CREATE TABLE IF NOT EXISTS sessions(
+        sid TEXT PRIMARY KEY, user_id TEXT, username TEXT, lang TEXT,
+        started TEXT, last_seen TEXT, seconds INTEGER DEFAULT 0)""")
     con.commit()
     return con
 
@@ -226,8 +239,31 @@ def collect_x():
     return fresh
 
 
+def collect_youtube():
+    """أحدث فيديوهات قنوات يوتيوب عبر RSS الرسمي — بدون مفتاح API."""
+    fresh = []
+    for cid in YOUTUBE_CHANNEL_IDS:
+        url = "https://www.youtube.com/feeds/videos.xml?channel_id=" + cid
+        try:
+            feed = feedparser.parse(url)
+            source = "YouTube · " + feed.feed.get("title", cid)[:40]
+            for e in feed.entries[:10]:
+                title = e.get("title", "").strip()
+                link = e.get("link", "")
+                if not title or not link:
+                    continue
+                # قناتك تُنشر بالكامل بدون تصفية كلمات
+                cat = classify(title) or CAT_GENERAL
+                if save_news(link, title, source, "yt", cat):
+                    fresh.append({"title": title, "link": link, "source": source,
+                                  "origin": "yt", "category": cat})
+        except Exception as err:
+            print("youtube error:", cid, err)
+    return fresh
+
+
 def collect_all():
-    return collect_rss() + collect_x()
+    return collect_rss() + collect_x() + collect_youtube()
 
 
 # ==================== نصوص البوت ====================
@@ -333,6 +369,53 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏹️ /start")
 
 
+# ==================== إحصاءات الـ Mini App ====================
+def fmt_dur(seconds):
+    s = int(seconds or 0)
+    return str(s // 60) + "د " + str(s % 60) + "ث"
+
+
+def stats_text(hours=24):
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    sessions, users, total, avg, best = CON.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT user_id), COALESCE(SUM(seconds),0), "
+        "COALESCE(AVG(seconds),0), COALESCE(MAX(seconds),0) "
+        "FROM sessions WHERE started >= ?", (since,)).fetchone()
+    all_users = CON.execute(
+        "SELECT COUNT(DISTINCT user_id) FROM sessions").fetchone()[0]
+    live = CON.execute(
+        "SELECT COUNT(*) FROM sessions WHERE last_seen >= ?",
+        ((datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),)
+    ).fetchone()[0]
+    return ("📊 <b>إحصاءات Mini App — آخر " + str(hours) + " ساعة</b>\n\n"
+            "👥 مستخدمون فريدون: <b>" + str(users) + "</b>\n"
+            "🔓 عدد الجلسات: <b>" + str(sessions) + "</b>\n"
+            "⏱️ متوسط مدة الجلسة: <b>" + fmt_dur(avg) + "</b>\n"
+            "🏆 أطول جلسة: <b>" + fmt_dur(best) + "</b>\n"
+            "🧮 إجمالي الوقت: <b>" + fmt_dur(total) + "</b>\n"
+            "🟢 متصل الآن: <b>" + str(live) + "</b>\n"
+            "🌐 إجمالي المستخدمين (كل الوقت): <b>" + str(all_users) + "</b>")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(stats_text(24), parse_mode=ParseMode.HTML)
+
+
+async def job_stats(context: ContextTypes.DEFAULT_TYPE):
+    """منبّه يومي بإحصاءات الـ Mini App."""
+    target = ADMIN_CHAT_ID
+    if not target:
+        row = CON.execute("SELECT chat_id FROM subs LIMIT 1").fetchone()
+        target = row[0] if row else None
+    if not target:
+        return
+    try:
+        await context.bot.send_message(target, "🔔 " + stats_text(24),
+                                       parse_mode=ParseMode.HTML)
+    except Exception as err:
+        print("stats error:", err)
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -372,9 +455,14 @@ async def job_push(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.4)
         if CHANNEL_ID:
             try:
+                # القناة تُنشر بلغة CHANNEL_LANG (العربية افتراضيًا)
+                ch_title = await asyncio.to_thread(
+                    translate, item["title"], CHANNEL_LANG)
+                tag = ("🐦 X" if item["origin"] == "x"
+                       else "▶️ يوتيوب" if item["origin"] == "yt" else "📰")
                 await context.bot.send_message(
                     CHANNEL_ID,
-                    "<b>" + item["title"] + "</b>\n<i>" + item["source"]
+                    tag + "\n\n<b>" + ch_title + "</b>\n<i>" + item["source"]
                     + "</i>\n" + item["link"], parse_mode=ParseMode.HTML)
             except Exception as err:
                 print("channel error:", err)
@@ -392,6 +480,45 @@ def api_news(category: str = "", origin: str = "", lang: str = "en", limit: int 
         i["title"] = translate(i["title"], lang)
     return JSONResponse({"server_time": datetime.now(timezone.utc).isoformat(),
                          "items": items})
+
+
+@api.post("/api/track")
+async def api_track(req: Request):
+    """يستقبل نبضات الجلسة من الـ Mini App (بدء / نبضة / نهاية)."""
+    try:
+        body = await req.json()
+    except Exception:
+        return {"ok": False}
+    sid = str(body.get("sid", ""))[:64]
+    if not sid:
+        return {"ok": False}
+    now = datetime.now(timezone.utc).isoformat()
+    seconds = int(body.get("seconds") or 0)
+    if body.get("event") == "start":
+        CON.execute(
+            "INSERT OR IGNORE INTO sessions(sid,user_id,username,lang,"
+            "started,last_seen,seconds) VALUES (?,?,?,?,?,?,0)",
+            (sid, str(body.get("user_id", "anon"))[:32],
+             str(body.get("username", ""))[:64],
+             str(body.get("lang", ""))[:5], now, now))
+    else:
+        CON.execute(
+            "UPDATE sessions SET last_seen = ?, seconds = MAX(seconds, ?) "
+            "WHERE sid = ?", (now, seconds, sid))
+    CON.commit()
+    return {"ok": True}
+
+
+@api.get("/api/stats")
+def api_stats(hours: int = 24):
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    s, u, total, avg, best = CON.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT user_id), COALESCE(SUM(seconds),0), "
+        "COALESCE(AVG(seconds),0), COALESCE(MAX(seconds),0) "
+        "FROM sessions WHERE started >= ?", (since,)).fetchone()
+    return {"hours": hours, "sessions": s, "unique_users": u,
+            "total_seconds": int(total), "avg_seconds": round(avg or 0, 1),
+            "max_seconds": int(best)}
 
 
 @api.get("/app", response_class=HTMLResponse)
@@ -421,9 +548,12 @@ def main():
     app.add_handler(CommandHandler("x", x_cmd))
     app.add_handler(CommandHandler("latest", latest_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
 
     app.job_queue.run_repeating(job_push, interval=INTERVAL_MINUTES * 60, first=10)
+    app.job_queue.run_daily(
+        job_stats, time=dtime(hour=STATS_HOUR_UTC, minute=0, tzinfo=timezone.utc))
     app.run_polling()
 
 
