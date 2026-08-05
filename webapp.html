@@ -59,19 +59,19 @@ tg?.ready(); tg?.expand();
 
 const I18N = {
   ar:{code:"ar-DZ",dir:"rtl",title:"🪙 أخبار الكريبتو",all:"الكل",mining:"⛏️ التعدين",
-      trading:"📈 التداول",x:"🐦 X",loading:"جارٍ التحميل…",empty:"لا توجد أخبار حاليًا",
+      trading:"📈 التداول",x:"🐦 X",yt:"▶️ يوتيوب",loading:"جارٍ التحميل…",empty:"لا توجد أخبار حاليًا",
       error:"تعذّر تحميل الأخبار",updated:"آخر تحديث"},
   en:{code:"en-GB",dir:"ltr",title:"🪙 Crypto News",all:"All",mining:"⛏️ Mining",
-      trading:"📈 Trading",x:"🐦 X",loading:"Loading…",empty:"No news right now",
+      trading:"📈 Trading",x:"🐦 X",yt:"▶️ YouTube",loading:"Loading…",empty:"No news right now",
       error:"Failed to load news",updated:"Last update"},
   fr:{code:"fr-FR",dir:"ltr",title:"🪙 Actus Crypto",all:"Tout",mining:"⛏️ Minage",
-      trading:"📈 Trading",x:"🐦 X",loading:"Chargement…",empty:"Aucune actualité",
+      trading:"📈 Trading",x:"🐦 X",yt:"▶️ YouTube",loading:"Chargement…",empty:"Aucune actualité",
       error:"Échec du chargement",updated:"Dernière mise à jour"},
   de:{code:"de-DE",dir:"ltr",title:"🪙 Krypto-News",all:"Alle",mining:"⛏️ Mining",
-      trading:"📈 Trading",x:"🐦 X",loading:"Wird geladen…",empty:"Keine News",
+      trading:"📈 Trading",x:"🐦 X",yt:"▶️ YouTube",loading:"Wird geladen…",empty:"Keine News",
       error:"Laden fehlgeschlagen",updated:"Letzte Aktualisierung"},
   es:{code:"es-ES",dir:"ltr",title:"🪙 Noticias Cripto",all:"Todo",mining:"⛏️ Minería",
-      trading:"📈 Trading",x:"🐦 X",loading:"Cargando…",empty:"Sin noticias",
+      trading:"📈 Trading",x:"🐦 X",yt:"▶️ YouTube",loading:"Cargando…",empty:"Sin noticias",
       error:"Error al cargar",updated:"Última actualización"}
 };
 const FLAGS = {ar:"🇸🇦", en:"🇬🇧", fr:"🇫🇷", de:"🇩🇪", es:"🇪🇸"};
@@ -108,7 +108,8 @@ function buildFlags(){
 
 function buildTabs(){
   const T = I18N[lang];
-  const defs = [["all",T.all],["mining",T.mining],["trading",T.trading],["x",T.x]];
+  const defs = [["all",T.all],["mining",T.mining],["trading",T.trading],
+                ["x",T.x],["yt",T.yt]];
   document.getElementById("tabs").innerHTML = defs.map(([k,label]) =>
     `<button class="tab ${k===filter.key?"on":""}" data-k="${k}">${label}</button>`
   ).join("");
@@ -131,7 +132,7 @@ async function load(){
   const T = I18N[lang], list = document.getElementById("list");
   list.innerHTML = `<div class="state">${T.loading}</div>`;
   const q = new URLSearchParams({lang});
-  if (filter.key === "x") q.set("origin", "x");
+  if (filter.key === "x" || filter.key === "yt") q.set("origin", filter.key);
   else if (filter.key !== "all") q.set("category", filter.key);
   try {
     const res = await fetch("/api/news?" + q.toString(), {cache:"no-store"});
@@ -140,7 +141,7 @@ async function load(){
     if (!items.length){ list.innerHTML = `<div class="state">${T.empty}</div>`; return; }
     list.innerHTML = items.map(n => `
       <a class="card" href="${n.link}" target="_blank" rel="noopener">
-        <h3>${n.origin === "x" ? "🐦 " : ""}${escapeHtml(n.title)}</h3>
+        <h3>${n.origin === "x" ? "🐦 " : n.origin === "yt" ? "▶️ " : ""}${escapeHtml(n.title)}</h3>
         <div class="meta">
           <span>${escapeHtml(n.source)}</span>
           <span class="badge">${T[n.category] || n.category}</span>
@@ -157,6 +158,37 @@ function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c =>
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
+
+/* ---------- تتبّع الاستخدام: عدد المستخدمين ومدة الجلسة ---------- */
+const U = tg?.initDataUnsafe?.user || {};
+const SID = (U.id || "anon") + "-" + Date.now();
+const T0 = Date.now();
+
+function track(event){
+  const payload = JSON.stringify({
+    sid: SID, event,
+    user_id: String(U.id || "anon"),
+    username: U.username || "",
+    lang: lang,
+    seconds: Math.round((Date.now() - T0) / 1000)
+  });
+  try {
+    if (event === "end" && navigator.sendBeacon) {
+      navigator.sendBeacon("/api/track",
+        new Blob([payload], {type: "application/json"}));
+    } else {
+      fetch("/api/track", {method: "POST", keepalive: true,
+        headers: {"Content-Type": "application/json"}, body: payload});
+    }
+  } catch(e){}
+}
+
+track("start");
+setInterval(() => track("ping"), 15000);          // نبضة كل 15 ثانية
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") track("end");
+});
+window.addEventListener("pagehide", () => track("end"));
 
 applyLang();
 setInterval(load, 60000);   // تحديث لحظي كل دقيقة
