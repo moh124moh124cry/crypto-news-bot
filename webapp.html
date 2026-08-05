@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>أخبار الكريبتو</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+       background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#111)}
+  header{padding:14px 16px;font-weight:700;font-size:18px}
+  .tabs{display:flex;gap:8px;padding:0 16px 12px;overflow-x:auto}
+  .tab{padding:8px 14px;border-radius:999px;border:none;font-size:14px;
+       background:var(--tg-theme-secondary-bg-color,#f0f0f0);color:inherit;white-space:nowrap}
+  .tab.on{background:var(--tg-theme-button-color,#2481cc);color:#fff}
+  .card{margin:0 16px 10px;padding:12px 14px;border-radius:14px;
+        background:var(--tg-theme-secondary-bg-color,#f6f6f6)}
+  .card h3{margin:0 0 6px;font-size:15px;line-height:1.4}
+  .meta{font-size:12px;opacity:.65;display:flex;justify-content:space-between}
+  a{color:inherit;text-decoration:none}
+  .empty{text-align:center;opacity:.6;padding:40px 16px}
+</style>
+</head>
+<body>
+<header>🪙 أخبار العملات المشفرة</header>
+<div class="tabs">
+  <button class="tab on" data-c="">الكل</button>
+  <button class="tab" data-c="⛏️ تعدين / بوتات تعدين">⛏️ تعدين</button>
+  <button class="tab" data-c="📈 تداول وأسواق">📈 تداول</button>
+  <button class="tab" data-c="🪙 أخبار عامة">🪙 عام</button>
+</div>
+<div id="list"><div class="empty">جارٍ التحميل…</div></div>
+
+<script>
+const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+
+async function load(cat = "") {
+  const list = document.getElementById("list");
+  list.innerHTML = '<div class="empty">جارٍ التحميل…</div>';
+  try {
+    const res = await fetch("/api/news?category=" + encodeURIComponent(cat));
+    const data = await res.json();
+    if (!data.length) { list.innerHTML = '<div class="empty">لا توجد أخبار حاليًا</div>'; return; }
+    list.innerHTML = data.map(n => `
+      <a class="card" href="${n.link}" target="_blank" style="display:block">
+        <h3>${n.title}</h3>
+        <div class="meta"><span>${n.source}</span><span>${n.category}</span></div>
+      </a>`).join("");
+  } catch (e) {
+    list.innerHTML = '<div class="empty">تعذّر تحميل الأخبار</div>';
+  }
+}
+
+document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.remove("on"));
+  b.classList.add("on");
+  load(b.dataset.c);
+});
+
+load();
+setInterval(() => load(document.querySelector(".tab.on").dataset.c), 120000);
+</script>
+</body>
+</html>
