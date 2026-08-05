@@ -2,64 +2,164 @@
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>أخبار الكريبتو</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Crypto News</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-  :root { color-scheme: light dark; }
-  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
-       background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#111)}
-  header{padding:14px 16px;font-weight:700;font-size:18px}
-  .tabs{display:flex;gap:8px;padding:0 16px 12px;overflow-x:auto}
-  .tab{padding:8px 14px;border-radius:999px;border:none;font-size:14px;
-       background:var(--tg-theme-secondary-bg-color,#f0f0f0);color:inherit;white-space:nowrap}
-  .tab.on{background:var(--tg-theme-button-color,#2481cc);color:#fff}
-  .card{margin:0 16px 10px;padding:12px 14px;border-radius:14px;
-        background:var(--tg-theme-secondary-bg-color,#f6f6f6)}
-  .card h3{margin:0 0 6px;font-size:15px;line-height:1.4}
-  .meta{font-size:12px;opacity:.65;display:flex;justify-content:space-between}
-  a{color:inherit;text-decoration:none}
-  .empty{text-align:center;opacity:.6;padding:40px 16px}
+:root{color-scheme:light dark;--bg:var(--tg-theme-bg-color,#0f1115);
+ --fg:var(--tg-theme-text-color,#f2f2f2);--card:var(--tg-theme-secondary-bg-color,#1b1f27);
+ --accent:var(--tg-theme-button-color,#2481cc);--muted:#8a93a3}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+ font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.top{padding:14px 16px 8px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.title{font-size:17px;font-weight:700}
+.flags{display:flex;gap:4px}
+.flag{background:none;border:1px solid transparent;border-radius:10px;
+ font-size:19px;padding:3px 5px;cursor:pointer;line-height:1;opacity:.5}
+.flag.on{opacity:1;border-color:var(--accent);background:rgba(36,129,204,.12)}
+.clock{margin:0 16px 12px;padding:12px 14px;border-radius:14px;background:var(--card);
+ display:flex;align-items:center;justify-content:space-between;gap:8px}
+.time{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:1px}
+.date{font-size:13px;color:var(--muted);text-align:end}
+.tabs{display:flex;gap:8px;padding:0 16px 12px;overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{padding:8px 14px;border-radius:999px;border:none;font-size:14px;
+ background:var(--card);color:inherit;white-space:nowrap;cursor:pointer}
+.tab.on{background:var(--accent);color:#fff;font-weight:600}
+.card{display:block;margin:0 16px 10px;padding:12px 14px;border-radius:14px;
+ background:var(--card);text-decoration:none;color:inherit}
+.card h3{margin:0 0 8px;font-size:15px;line-height:1.45;font-weight:600}
+.meta{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:8px}
+.badge{font-size:11px;padding:2px 7px;border-radius:999px;background:rgba(36,129,204,.18);
+ color:var(--accent);font-weight:600}
+.state{text-align:center;color:var(--muted);padding:44px 16px;font-size:14px}
+footer{padding:6px 16px 26px;text-align:center;color:var(--muted);font-size:11px}
 </style>
 </head>
 <body>
-<header>🪙 أخبار العملات المشفرة</header>
-<div class="tabs">
-  <button class="tab on" data-c="">الكل</button>
-  <button class="tab" data-c="⛏️ تعدين / بوتات تعدين">⛏️ تعدين</button>
-  <button class="tab" data-c="📈 تداول وأسواق">📈 تداول</button>
-  <button class="tab" data-c="🪙 أخبار عامة">🪙 عام</button>
+
+<div class="top">
+  <div class="title" id="appTitle">🪙 أخبار الكريبتو</div>
+  <div class="flags" id="flags"></div>
 </div>
-<div id="list"><div class="empty">جارٍ التحميل…</div></div>
+
+<div class="clock">
+  <div class="time" id="time">--:--:--</div>
+  <div class="date" id="date">—</div>
+</div>
+
+<div class="tabs" id="tabs"></div>
+<div id="list"><div class="state" id="state">…</div></div>
+<footer id="foot"></footer>
 
 <script>
-const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+const tg = window.Telegram?.WebApp;
+tg?.ready(); tg?.expand();
 
-async function load(cat = "") {
-  const list = document.getElementById("list");
-  list.innerHTML = '<div class="empty">جارٍ التحميل…</div>';
+const I18N = {
+  ar:{code:"ar-DZ",dir:"rtl",title:"🪙 أخبار الكريبتو",all:"الكل",mining:"⛏️ التعدين",
+      trading:"📈 التداول",x:"🐦 X",loading:"جارٍ التحميل…",empty:"لا توجد أخبار حاليًا",
+      error:"تعذّر تحميل الأخبار",updated:"آخر تحديث"},
+  en:{code:"en-GB",dir:"ltr",title:"🪙 Crypto News",all:"All",mining:"⛏️ Mining",
+      trading:"📈 Trading",x:"🐦 X",loading:"Loading…",empty:"No news right now",
+      error:"Failed to load news",updated:"Last update"},
+  fr:{code:"fr-FR",dir:"ltr",title:"🪙 Actus Crypto",all:"Tout",mining:"⛏️ Minage",
+      trading:"📈 Trading",x:"🐦 X",loading:"Chargement…",empty:"Aucune actualité",
+      error:"Échec du chargement",updated:"Dernière mise à jour"},
+  de:{code:"de-DE",dir:"ltr",title:"🪙 Krypto-News",all:"Alle",mining:"⛏️ Mining",
+      trading:"📈 Trading",x:"🐦 X",loading:"Wird geladen…",empty:"Keine News",
+      error:"Laden fehlgeschlagen",updated:"Letzte Aktualisierung"},
+  es:{code:"es-ES",dir:"ltr",title:"🪙 Noticias Cripto",all:"Todo",mining:"⛏️ Minería",
+      trading:"📈 Trading",x:"🐦 X",loading:"Cargando…",empty:"Sin noticias",
+      error:"Error al cargar",updated:"Última actualización"}
+};
+const FLAGS = {ar:"🇸🇦", en:"🇬🇧", fr:"🇫🇷", de:"🇩🇪", es:"🇪🇸"};
+
+const params = new URLSearchParams(location.search);
+let lang = params.get("lang")
+        || localStorage.getItem("lang")
+        || (tg?.initDataUnsafe?.user?.language_code || "ar").slice(0,2);
+if (!I18N[lang]) lang = "ar";
+let filter = {key:"all"};
+
+/* ---------- الساعة والتاريخ (تلقائي) ---------- */
+function tickClock(){
+  const now = new Date(), L = I18N[lang].code;
+  document.getElementById("time").textContent =
+    now.toLocaleTimeString(L, {hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
+  document.getElementById("date").textContent =
+    now.toLocaleDateString(L, {weekday:"long", day:"numeric", month:"long", year:"numeric"});
+}
+setInterval(tickClock, 1000);
+
+/* ---------- الواجهة ---------- */
+function buildFlags(){
+  document.getElementById("flags").innerHTML = Object.keys(FLAGS).map(l =>
+    `<button class="flag ${l===lang?"on":""}" data-l="${l}" title="${l}">${FLAGS[l]}</button>`
+  ).join("");
+  document.querySelectorAll(".flag").forEach(b => b.onclick = () => {
+    lang = b.dataset.l;
+    localStorage.setItem("lang", lang);
+    tg?.HapticFeedback?.selectionChanged();
+    applyLang();
+  });
+}
+
+function buildTabs(){
+  const T = I18N[lang];
+  const defs = [["all",T.all],["mining",T.mining],["trading",T.trading],["x",T.x]];
+  document.getElementById("tabs").innerHTML = defs.map(([k,label]) =>
+    `<button class="tab ${k===filter.key?"on":""}" data-k="${k}">${label}</button>`
+  ).join("");
+  document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
+    filter = {key:b.dataset.k};
+    buildTabs(); load();
+  });
+}
+
+function applyLang(){
+  const T = I18N[lang];
+  document.documentElement.lang = lang;
+  document.documentElement.dir = T.dir;
+  document.getElementById("appTitle").textContent = T.title;
+  buildFlags(); buildTabs(); tickClock(); load();
+}
+
+/* ---------- تحميل الأخبار ---------- */
+async function load(){
+  const T = I18N[lang], list = document.getElementById("list");
+  list.innerHTML = `<div class="state">${T.loading}</div>`;
+  const q = new URLSearchParams({lang});
+  if (filter.key === "x") q.set("origin", "x");
+  else if (filter.key !== "all") q.set("category", filter.key);
   try {
-    const res = await fetch("/api/news?category=" + encodeURIComponent(cat));
+    const res = await fetch("/api/news?" + q.toString(), {cache:"no-store"});
     const data = await res.json();
-    if (!data.length) { list.innerHTML = '<div class="empty">لا توجد أخبار حاليًا</div>'; return; }
-    list.innerHTML = data.map(n => `
-      <a class="card" href="${n.link}" target="_blank" style="display:block">
-        <h3>${n.title}</h3>
-        <div class="meta"><span>${n.source}</span><span>${n.category}</span></div>
+    const items = data.items || [];
+    if (!items.length){ list.innerHTML = `<div class="state">${T.empty}</div>`; return; }
+    list.innerHTML = items.map(n => `
+      <a class="card" href="${n.link}" target="_blank" rel="noopener">
+        <h3>${n.origin === "x" ? "🐦 " : ""}${escapeHtml(n.title)}</h3>
+        <div class="meta">
+          <span>${escapeHtml(n.source)}</span>
+          <span class="badge">${T[n.category] || n.category}</span>
+        </div>
       </a>`).join("");
-  } catch (e) {
-    list.innerHTML = '<div class="empty">تعذّر تحميل الأخبار</div>';
+    document.getElementById("foot").textContent =
+      T.updated + ": " + new Date().toLocaleTimeString(T.code);
+  } catch(e){
+    list.innerHTML = `<div class="state">${T.error}</div>`;
   }
 }
 
-document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
-  document.querySelectorAll(".tab").forEach(x => x.classList.remove("on"));
-  b.classList.add("on");
-  load(b.dataset.c);
-});
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
 
-load();
-setInterval(() => load(document.querySelector(".tab.on").dataset.c), 120000);
+applyLang();
+setInterval(load, 60000);   // تحديث لحظي كل دقيقة
 </script>
 </body>
 </html>
