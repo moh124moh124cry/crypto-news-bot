@@ -12,7 +12,8 @@ import uvicorn
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.constants import ParseMode
-from telegram.ext import Application
+from telegram.ext import Application, ContextTypes
+
 
 # ---------------- الإعدادات ----------------
 TOKEN = os.environ["BOT_TOKEN"]
