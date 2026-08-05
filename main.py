@@ -1,8 +1,11 @@
 import os
 import re
+import json
 import sqlite3
 import asyncio
 import threading
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 import feedparser
@@ -12,212 +15,417 @@ import uvicorn
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.constants import ParseMode
-from telegram.ext import Application, ContextTypes, CommandHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-
-# ---------------- الإعدادات ----------------
+# ==================== الإعدادات ====================
 TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "")      # اختياري: "@my_crypto_news"
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "")      # رابط الاستضافة العام + "/app"
-INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "10"))
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
+INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "3"))
+X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "news.db")
 
-# مصادر RSS موثوقة للعملات المشفرة
+LANGS = ["ar", "en", "fr", "de", "es"]
+DEFAULT_LANG = os.environ.get("DEFAULT_LANG", "ar")
+
+# ---- أكبر مصادر أخبار التشفير ----
 FEEDS = [
-    "https://cointelegraph.com/rss",
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cryptopotato.com/feed/",
-    "https://bitcoinmagazine.com/feed",
+    "https://cointelegraph.com/rss",
+    "https://www.theblock.co/rss.xml",
     "https://decrypt.co/feed",
-    "https://ambcrypto.com/feed/",
+    "https://beincrypto.com/feed/",
+    "https://cryptoslate.com/feed/",
+    "https://blockworks.co/feed",
+    "https://www.newsbtc.com/feed/",
+    "https://coingape.com/feed/",
     "https://u.today/rss",
+    "https://ambcrypto.com/feed/",
+    "https://cryptopotato.com/feed/",
     "https://news.bitcoin.com/feed/",
+    "https://bitcoinmagazine.com/feed",
 ]
 
-# كلمات التصنيف
+# ---- جسور RSS لأخبار X (المسار ب) ----
+X_RSS_FEEDS = [
+    # "https://rsshub.app/twitter/user/MinerUpdate",
+    # "https://rss.app/feeds/XXXXXXXX.xml",
+]
+
+# ---- بحث X عن التعدين والعملات الرقمية (المسار أ) ----
+X_QUERY = (
+    '("crypto mining" OR "bitcoin mining" OR "mining bot" OR "mining app" '
+    'OR hashrate OR ASIC OR "tap to earn" OR "mining rig" OR "cloud mining") '
+    '-is:retweet -is:reply (lang:en OR lang:ar)'
+)
+
+# ==================== التصنيف ====================
 MINING_WORDS = [
-    "mining", "miner", "miners", "hashrate", "asic", "mining bot", "tap to earn",
-    "tap-to-earn", "telegram mining", "mining app", "cloud mining", "airdrop",
-    "testnet mining", "proof of work", "pow",
+    "mining", "miner", "miners", "hashrate", "hash rate", "asic", "mining bot",
+    "mining app", "mini app", "clicker", "tap to earn", "tap-to-earn",
+    "telegram mining", "cloud mining", "mining rig", "airdrop", "proof of work",
 ]
 TRADING_WORDS = [
     "trading", "trader", "futures", "spot", "leverage", "liquidation", "exchange",
-    "binance", "bybit", "okx", "price analysis", "technical analysis", "etf",
-    "bull", "bear", "rally", "dump", "pump", "market",
+    "binance", "bybit", "okx", "coinbase", "price analysis", "technical analysis",
+    "etf", "rally", "pump", "dump", "market", "bullish", "bearish",
 ]
 GENERAL_WORDS = [
     "bitcoin", "btc", "ethereum", "eth", "crypto", "altcoin", "solana", "ton",
-    "blockchain", "stablecoin", "defi", "token", "sec", "regulation",
+    "blockchain", "stablecoin", "defi", "token", "sec", "regulation", "halving",
 ]
-# استثناءات (ضوضاء)
-BLOCK_WORDS = ["sponsored", "press release", "casino", "gambling", "betting"]
+BLOCK_WORDS = ["sponsored", "press release", "casino", "gambling", "betting", "giveaway"]
+
+CAT_MINING, CAT_TRADING, CAT_GENERAL = "mining", "trading", "general"
+
 
 def classify(text: str):
-    """يُعيد التصنيف أو None إذا كان الخبر غير مطابق."""
     t = text.lower()
     if any(w in t for w in BLOCK_WORDS):
         return None
     if any(w in t for w in MINING_WORDS):
-        return "⛏️ تعدين / بوتات تعدين"
+        return CAT_MINING
     if any(w in t for w in TRADING_WORDS):
-        return "📈 تداول وأسواق"
+        return CAT_TRADING
     if any(w in t for w in GENERAL_WORDS):
-        return "🪙 أخبار عامة"
+        return CAT_GENERAL
     return None
 
-# ---------------- قاعدة البيانات ----------------
+
+# ==================== الترجمة ====================
+_TR_CACHE = {}
+
+
+def translate(text: str, target: str) -> str:
+    """ترجمة خفيفة مع تخزين مؤقت. تُعيد النص الأصلي عند أي خطأ."""
+    if not text or target == "en":
+        return text
+    key = (target, text)
+    if key in _TR_CACHE:
+        return _TR_CACHE[key]
+    try:
+        url = ("https://translate.googleapis.com/translate_a/single"
+               "?client=gtx&sl=auto&tl=" + target + "&dt=t&q="
+               + urllib.parse.quote(text))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        out = "".join(seg[0] for seg in data[0] if seg and seg[0])
+    except Exception:
+        out = text
+    if len(_TR_CACHE) > 4000:
+        _TR_CACHE.clear()
+    _TR_CACHE[key] = out
+    return out
+
+
+# ==================== قاعدة البيانات ====================
 def db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.execute("""CREATE TABLE IF NOT EXISTS news(
-        link TEXT PRIMARY KEY, title TEXT, source TEXT,
+        link TEXT PRIMARY KEY, title TEXT, source TEXT, origin TEXT,
         category TEXT, created TEXT)""")
-    con.execute("CREATE TABLE IF NOT EXISTS subs(chat_id INTEGER PRIMARY KEY)")
+    con.execute("""CREATE TABLE IF NOT EXISTS subs(
+        chat_id INTEGER PRIMARY KEY, lang TEXT DEFAULT 'ar')""")
     con.commit()
     return con
 
 CON = db()
 
-def save_news(link, title, source, category):
-    try:
-        CON.execute(
-            "INSERT INTO news VALUES (?,?,?,?,?)",
-            (link, title, source, category, datetime.now(timezone.utc).isoformat()),
-        )
-        CON.commit()
-        return True          # خبر جديد
-    except sqlite3.IntegrityError:
-        return False         # مكرر
 
-def latest(limit=40, category=None):
-    q = "SELECT title, link, source, category, created FROM news"
+def save_news(link, title, source, origin, category):
+    try:
+        CON.execute("INSERT INTO news VALUES (?,?,?,?,?,?)",
+                    (link, title, source, origin, category,
+                     datetime.now(timezone.utc).isoformat()))
+        CON.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def latest(limit=50, category=None, origin=None):
+    q = "SELECT title, link, source, origin, category, created FROM news WHERE 1=1"
     p = []
     if category:
-        q += " WHERE category = ?"
-        p.append(category)
-    q += " ORDER BY created DESC LIMIT ?"
-    p.append(limit)
-    return [
-        {"title": r[0], "link": r[1], "source": r[2], "category": r[3], "date": r[4]}
-        for r in CON.execute(q, p).fetchall()
-    ]
+        q += " AND category = ?"; p.append(category)
+    if origin:
+        q += " AND origin = ?"; p.append(origin)
+    q += " ORDER BY created DESC LIMIT ?"; p.append(limit)
+    return [{"title": r[0], "link": r[1], "source": r[2], "origin": r[3],
+             "category": r[4], "date": r[5]}
+            for r in CON.execute(q, p).fetchall()]
 
-# ---------------- جمع الأخبار ----------------
-def collect():
+
+def get_lang(chat_id):
+    row = CON.execute("SELECT lang FROM subs WHERE chat_id = ?", (chat_id,)).fetchone()
+    return row[0] if row and row[0] in LANGS else DEFAULT_LANG
+
+
+def set_lang(chat_id, lang):
+    CON.execute("INSERT INTO subs(chat_id, lang) VALUES (?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET lang = excluded.lang",
+                (chat_id, lang))
+    CON.commit()
+
+
+# ==================== جمع الأخبار ====================
+def collect_rss():
     fresh = []
-    for url in FEEDS:
+    for url in FEEDS + X_RSS_FEEDS:
+        origin = "x" if url in X_RSS_FEEDS else "news"
         try:
             feed = feedparser.parse(url)
-            source = feed.feed.get("title", url)
+            source = feed.feed.get("title", url)[:60]
             for e in feed.entries[:25]:
                 title = re.sub(r"<[^>]+>", "", e.get("title", "")).strip()
                 link = e.get("link", "")
                 summary = re.sub(r"<[^>]+>", "", e.get("summary", ""))[:300]
                 if not title or not link:
                     continue
-                cat = classify(f"{title} {summary}")
-                if not cat:
+                cat = classify(title + " " + summary)
+                if origin == "x" and cat is None:
                     continue
-                if save_news(link, title, source, cat):
-                    fresh.append({"title": title, "link": link,
-                                  "source": source, "category": cat})
+                if cat is None:
+                    continue
+                if save_news(link, title, source, origin, cat):
+                    fresh.append({"title": title, "link": link, "source": source,
+                                  "origin": origin, "category": cat})
         except Exception as err:
             print("feed error:", url, err)
     return fresh
 
-async def job_push(context: ContextTypes.DEFAULT_TYPE):
-    """يعمل تلقائيًا كل INTERVAL_MINUTES دقيقة."""
-    fresh = await asyncio.to_thread(collect)
-    if not fresh:
-        return
-    targets = [r[0] for r in CON.execute("SELECT chat_id FROM subs").fetchall()]
-    if CHANNEL_ID:
-        targets.append(CHANNEL_ID)
 
-    for item in fresh[:8]:                      # حد أقصى لتجنّب الإزعاج
-        msg = (f"{item['category']}\n\n<b>{item['title']}</b>\n"
-               f"<i>{item['source']}</i>\n{item['link']}")
-        for chat in targets:
-            try:
-                await context.bot.send_message(
-                    chat, msg, parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False)
-            except Exception as err:
-                print("send error:", chat, err)
-            await asyncio.sleep(0.4)
+def collect_x():
+    """أخبار لحظية من X عبر الواجهة الرسمية."""
+    if not X_BEARER_TOKEN:
+        return []
+    fresh = []
+    try:
+        url = ("https://api.x.com/2/tweets/search/recent?query="
+               + urllib.parse.quote(X_QUERY)
+               + "&max_results=25&tweet.fields=created_at&expansions=author_id"
+               "&user.fields=username,verified")
+        req = urllib.request.Request(
+            url, headers={"Authorization": "Bearer " + X_BEARER_TOKEN})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        users = {u["id"]: u["username"]
+                 for u in data.get("includes", {}).get("users", [])}
+        for t in data.get("data", []):
+            text = re.sub(r"\s+", " ", t.get("text", "")).strip()
+            user = users.get(t.get("author_id", ""), "i/web")
+            link = "https://x.com/" + user + "/status/" + t["id"]
+            cat = classify(text) or CAT_MINING
+            if save_news(link, text[:220], "X · @" + user, "x", cat):
+                fresh.append({"title": text[:220], "link": link,
+                              "source": "X · @" + user, "origin": "x",
+                              "category": cat})
+    except Exception as err:
+        print("x error:", err)
+    return fresh
 
-# ---------------- أوامر البوت ----------------
-def kb():
+
+def collect_all():
+    return collect_rss() + collect_x()
+
+
+# ==================== نصوص البوت ====================
+T = {
+    "welcome": {
+        "ar": "✅ تم تشغيل الاشتراك التلقائي.\nستصلك أخبار الكريبتو والتعدين لحظيًا كل {m} دقائق.",
+        "en": "✅ Auto-subscription enabled.\nYou'll receive live crypto & mining news every {m} minutes.",
+        "fr": "✅ Abonnement automatique activé.\nActualités crypto et minage toutes les {m} minutes.",
+        "de": "✅ Automatisches Abo aktiviert.\nKrypto- und Mining-News alle {m} Minuten.",
+        "es": "✅ Suscripción automática activada.\nNoticias de cripto y minería cada {m} minutos.",
+    },
+    "open_app": {"ar": "📱 افتح التطبيق", "en": "📱 Open app", "fr": "📱 Ouvrir l'app",
+                 "de": "📱 App öffnen", "es": "📱 Abrir la app"},
+    "mining": {"ar": "⛏️ التعدين", "en": "⛏️ Mining", "fr": "⛏️ Minage",
+               "de": "⛏️ Mining", "es": "⛏️ Minería"},
+    "trading": {"ar": "📈 التداول", "en": "📈 Trading", "fr": "📈 Trading",
+                "de": "📈 Trading", "es": "📈 Trading"},
+    "x_news": {"ar": "🐦 أخبار X", "en": "🐦 X news", "fr": "🐦 Actus X",
+               "de": "🐦 X-News", "es": "🐦 Noticias X"},
+    "lang_set": {"ar": "🌍 تم تعيين اللغة: العربية", "en": "🌍 Language set: English",
+                 "fr": "🌍 Langue définie : Français", "de": "🌍 Sprache: Deutsch",
+                 "es": "🌍 Idioma: Español"},
+    "empty": {"ar": "لا توجد أخبار بعد، انتظر الدورة القادمة.",
+              "en": "No news yet, wait for the next cycle.",
+              "fr": "Pas encore d'actualités.", "de": "Noch keine News.",
+              "es": "Aún no hay noticias."},
+}
+
+FLAGS = {"ar": "🇸🇦 العربية", "en": "🇬🇧 English", "fr": "🇫🇷 Français",
+         "de": "🇩🇪 Deutsch", "es": "🇪🇸 Español"}
+
+
+def t(key, lang, **kw):
+    s = T[key].get(lang, T[key]["en"])
+    return s.format(**kw) if kw else s
+
+
+def main_kb(lang):
     rows = []
     if WEBAPP_URL:
         rows.append([InlineKeyboardButton(
-            "📱 افتح التطبيق", web_app=WebAppInfo(url=WEBAPP_URL))])
-    rows.append([InlineKeyboardButton("⛏️ تعدين", callback_data="m"),
-                 InlineKeyboardButton("📈 تداول", callback_data="t")])
+            t("open_app", lang),
+            web_app=WebAppInfo(url=WEBAPP_URL + "?lang=" + lang))])
+    rows.append([InlineKeyboardButton(t("mining", lang), callback_data="c:mining"),
+                 InlineKeyboardButton(t("trading", lang), callback_data="c:trading")])
+    rows.append([InlineKeyboardButton(t("x_news", lang), callback_data="c:x")])
+    rows.append([InlineKeyboardButton(FLAGS[l], callback_data="l:" + l)
+                 for l in LANGS])
     return InlineKeyboardMarkup(rows)
 
+
+# ==================== الأوامر ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    CON.execute("INSERT OR IGNORE INTO subs VALUES (?)",
-                (update.effective_chat.id,))
-    CON.commit()
+    chat = update.effective_chat.id
+    code = (update.effective_user.language_code or DEFAULT_LANG)[:2]
+    lang = code if code in LANGS else DEFAULT_LANG
+    set_lang(chat, lang)
     await update.message.reply_text(
-        "✅ تم تشغيل الاشتراك التلقائي.\n\n"
-        f"سأرسل لك أخبار العملات المشفرة (تعدين + تداول) كل {INTERVAL_MINUTES} دقيقة.\n\n"
-        "الأوامر:\n/mining أخبار التعدين\n/trading أخبار التداول\n"
-        "/latest آخر الأخبار\n/stop إيقاف الإرسال",
-        reply_markup=kb())
+        t("welcome", lang, m=INTERVAL_MINUTES), reply_markup=main_kb(lang))
 
-async def send_list(update: Update, category=None, title="آخر الأخبار"):
-    items = latest(10, category)
-    if not items:
-        await update.message.reply_text("لا توجد أخبار بعد، انتظر الدورة القادمة.")
-        return
-    body = "\n\n".join(
-        f"<b>{i['title']}</b>\n{i['link']}" for i in items)
-    await update.message.reply_text(f"<b>{title}</b>\n\n{body}",
-                                    parse_mode=ParseMode.HTML,
-                                    disable_web_page_preview=True)
 
-async def mining(u, c):  await send_list(u, "⛏️ تعدين / بوتات تعدين", "⛏️ أخبار التعدين")
-async def trading(u, c): await send_list(u, "📈 تداول وأسواق", "📈 أخبار التداول")
-async def latest_cmd(u, c): await send_list(u, None, "🗞️ آخر الأخبار")
+async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.effective_chat.id)
+    await update.message.reply_text(
+        "🌍 " + " / ".join(FLAGS.values()),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(FLAGS[l], callback_data="l:" + l)] for l in LANGS]))
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+def render(items, lang):
+    lines = []
+    for i in items:
+        title = translate(i["title"], lang)
+        tag = "🐦" if i["origin"] == "x" else "📰"
+        lines.append(tag + " <b>" + title + "</b>\n" + i["link"])
+    return "\n\n".join(lines)
+
+
+async def show(update_or_q, lang, category=None, origin=None):
+    items = latest(10, category, origin)
+    text = render(items, lang) if items else t("empty", lang)
+    if hasattr(update_or_q, "message") and update_or_q.message:
+        await update_or_q.message.reply_text(
+            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def mining_cmd(u, c):
+    await show(u, get_lang(u.effective_chat.id), CAT_MINING)
+
+async def trading_cmd(u, c):
+    await show(u, get_lang(u.effective_chat.id), CAT_TRADING)
+
+async def x_cmd(u, c):
+    await show(u, get_lang(u.effective_chat.id), None, "x")
+
+async def latest_cmd(u, c):
+    await show(u, get_lang(u.effective_chat.id))
+
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CON.execute("DELETE FROM subs WHERE chat_id = ?", (update.effective_chat.id,))
     CON.commit()
-    await update.message.reply_text("⏹️ تم إيقاف الإرسال. أرسل /start للعودة.")
+    await update.message.reply_text("⏹️ /start")
 
-# ---------------- خادم الـ Mini App ----------------
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat = q.message.chat_id
+    data = q.data or ""
+    if data.startswith("l:"):
+        lang = data[2:]
+        set_lang(chat, lang)
+        await q.message.reply_text(t("lang_set", lang), reply_markup=main_kb(lang))
+        return
+    lang = get_lang(chat)
+    key = data[2:]
+    items = (latest(10, None, "x") if key == "x" else latest(10, key))
+    await q.message.reply_text(
+        render(items, lang) if items else t("empty", lang),
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+# ==================== الدورة التلقائية ====================
+async def job_push(context: ContextTypes.DEFAULT_TYPE):
+    fresh = await asyncio.to_thread(collect_all)
+    if not fresh:
+        return
+    subs = CON.execute("SELECT chat_id, lang FROM subs").fetchall()
+    for item in fresh[:8]:
+        for chat_id, lang in subs:
+            lang = lang if lang in LANGS else DEFAULT_LANG
+            title = await asyncio.to_thread(translate, item["title"], lang)
+            tag = "🐦 X" if item["origin"] == "x" else "📰"
+            msg = (tag + "\n\n<b>" + title + "</b>\n<i>" + item["source"]
+                   + "</i>\n" + item["link"])
+            try:
+                await context.bot.send_message(chat_id, msg,
+                                               parse_mode=ParseMode.HTML)
+            except Exception as err:
+                print("send error:", chat_id, err)
+            await asyncio.sleep(0.4)
+        if CHANNEL_ID:
+            try:
+                await context.bot.send_message(
+                    CHANNEL_ID,
+                    "<b>" + item["title"] + "</b>\n<i>" + item["source"]
+                    + "</i>\n" + item["link"], parse_mode=ParseMode.HTML)
+            except Exception as err:
+                print("channel error:", err)
+
+
+# ==================== خادم الـ Mini App ====================
 api = FastAPI()
 
+
 @api.get("/api/news")
-def api_news(category: str = ""):
-    return JSONResponse(latest(50, category or None))
+def api_news(category: str = "", origin: str = "", lang: str = "en", limit: int = 50):
+    lang = lang if lang in LANGS else "en"
+    items = latest(limit, category or None, origin or None)
+    for i in items:
+        i["title"] = translate(i["title"], lang)
+    return JSONResponse({"server_time": datetime.now(timezone.utc).isoformat(),
+                         "items": items})
+
 
 @api.get("/app", response_class=HTMLResponse)
 def app_page():
     with open("webapp.html", encoding="utf-8") as f:
         return f.read()
 
+
 @api.get("/")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "feeds": len(FEEDS), "x_api": bool(X_BEARER_TOKEN)}
+
 
 def run_api():
     uvicorn.run(api, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
-# ---------------- الإقلاع ----------------
+
+# ==================== الإقلاع ====================
 def main():
     threading.Thread(target=run_api, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("mining", mining))
-    app.add_handler(CommandHandler("trading", trading))
+    app.add_handler(CommandHandler("lang", lang_cmd))
+    app.add_handler(CommandHandler("mining", mining_cmd))
+    app.add_handler(CommandHandler("trading", trading_cmd))
+    app.add_handler(CommandHandler("x", x_cmd))
     app.add_handler(CommandHandler("latest", latest_cmd))
-    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CallbackQueryHandler(on_button))
 
-    app.job_queue.run_repeating(job_push, interval=INTERVAL_MINUTES * 60, first=15)
+    app.job_queue.run_repeating(job_push, interval=INTERVAL_MINUTES * 60, first=10)
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
