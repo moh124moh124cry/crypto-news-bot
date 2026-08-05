@@ -21,7 +21,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
-INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "3"))
+INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "15"))
 X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "news.db")
 
@@ -38,22 +38,15 @@ YOUTUBE_CHANNEL_IDS = [c.strip() for c in
 LANGS = ["ar", "en", "fr", "de", "es"]
 DEFAULT_LANG = os.environ.get("DEFAULT_LANG", "ar")
 
-# ---- أكبر مصادر أخبار التشفير ----
+# ---- مصادر عربية فقط (حُذفت كل المصادر الأجنبية) ----
 FEEDS = [
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cointelegraph.com/rss",
-    "https://www.theblock.co/rss.xml",
-    "https://decrypt.co/feed",
-    "https://beincrypto.com/feed/",
-    "https://cryptoslate.com/feed/",
-    "https://blockworks.co/feed",
-    "https://www.newsbtc.com/feed/",
-    "https://coingape.com/feed/",
-    "https://u.today/rss",
-    "https://ambcrypto.com/feed/",
-    "https://cryptopotato.com/feed/",
-    "https://news.bitcoin.com/feed/",
-    "https://bitcoinmagazine.com/feed",
+    "https://ar.cointelegraph.com/rss",        # كوينتيليغراف العربية
+    "https://ar.beincrypto.com/feed/",         # BeInCrypto العربية
+    "https://cryptonews.com/ar/news/feed/",    # CryptoNews العربية
+    "https://arab-btc.net/feed/",              # بيتكوين العرب — قسم التعدين
+    # مصادر اقتصادية عربية إضافية (فعّلها إن أردت تغطية أوسع)
+    # "https://asharqbusiness.com/feed/",       # الشرق للأعمال مع بلومبرغ
+    # "https://www.snabusiness.com/rss",        # اقتصاد سكاي نيوز عربية
 ]
 
 # ---- جسور RSS لأخبار X (المسار ب) ----
@@ -70,21 +63,35 @@ X_QUERY = (
 )
 
 # ==================== التصنيف ====================
+# كلمات عربية أولًا لأن كل المصادر عربية، مع إبقاء الإنجليزية لأخبار X
 MINING_WORDS = [
+    "تعدين", "التعدين", "معدني", "المعدنين", "معدنو", "هاش", "الهاش", "هاشريت",
+    "معدل الهاش", "تعدين سحابي", "بوت تعدين", "تطبيق تعدين", "منصة تعدين",
+    "إيردروب", "ايردروب", "إثبات العمل", "اثبات العمل", "أجهزة التعدين",
     "mining", "miner", "miners", "hashrate", "hash rate", "asic", "mining bot",
     "mining app", "mini app", "clicker", "tap to earn", "tap-to-earn",
     "telegram mining", "cloud mining", "mining rig", "airdrop", "proof of work",
 ]
 TRADING_WORDS = [
+    "تداول", "التداول", "تحليل فني", "تحليل سعر", "توقعات سعر", "العقود الآجلة",
+    "الرافعة المالية", "تصفية", "منصة تداول", "بينانس", "باي بت", "كوين بيس",
+    "السوق", "صاعد", "هابط", "صندوق متداول", "ETF", "سعر البيتكوين",
     "trading", "trader", "futures", "spot", "leverage", "liquidation", "exchange",
     "binance", "bybit", "okx", "coinbase", "price analysis", "technical analysis",
     "etf", "rally", "pump", "dump", "market", "bullish", "bearish",
 ]
 GENERAL_WORDS = [
+    "بيتكوين", "بتكوين", "إيثريوم", "ايثريوم", "عملة رقمية", "العملات الرقمية",
+    "العملات المشفرة", "كريبتو", "بلوكشين", "بلوكتشين", "عملة مستقرة",
+    "ستيبل كوين", "توكن", "محفظة", "تنظيم", "هالفينغ", "سولانا", "ريبل",
     "bitcoin", "btc", "ethereum", "eth", "crypto", "altcoin", "solana", "ton",
     "blockchain", "stablecoin", "defi", "token", "sec", "regulation", "halving",
 ]
-BLOCK_WORDS = ["sponsored", "press release", "casino", "gambling", "betting", "giveaway"]
+BLOCK_WORDS = [
+    "إعلان مدفوع", "محتوى مدفوع", "بيان صحفي", "كازينو", "مراهنات", "قمار",
+    "برعاية", "مسابقة", "sponsored", "press release", "casino", "gambling",
+    "betting", "giveaway",
+]
 
 CAT_MINING, CAT_TRADING, CAT_GENERAL = "mining", "trading", "general"
 
@@ -106,9 +113,21 @@ def classify(text: str):
 _TR_CACHE = {}
 
 
+_AR_RE = re.compile(r"[؀-ۿ]")
+
+
+def is_arabic(text: str) -> bool:
+    return len(_AR_RE.findall(text or "")) >= 4
+
+
 def translate(text: str, target: str) -> str:
     """ترجمة خفيفة مع تخزين مؤقت. تُعيد النص الأصلي عند أي خطأ."""
-    if not text or target == "en":
+    if not text:
+        return text
+    # المصادر عربية أصلاً: لا حاجة لأي ترجمة عند طلب العربية
+    if target == "ar" and is_arabic(text):
+        return text
+    if target == "en" and not is_arabic(text):
         return text
     key = (target, text)
     if key in _TR_CACHE:
@@ -140,6 +159,9 @@ def db():
     con.execute("""CREATE TABLE IF NOT EXISTS sessions(
         sid TEXT PRIMARY KEY, user_id TEXT, username TEXT, lang TEXT,
         started TEXT, last_seen TEXT, seconds INTEGER DEFAULT 0)""")
+    # سجل ما نُشر فعلاً لمنع تكرار نفس الخبر في القناة
+    con.execute("""CREATE TABLE IF NOT EXISTS pushed(
+        key TEXT PRIMARY KEY, created TEXT)""")
     con.commit()
     return con
 
@@ -151,6 +173,29 @@ def save_news(link, title, source, origin, category):
         CON.execute("INSERT INTO news VALUES (?,?,?,?,?,?)",
                     (link, title, source, origin, category,
                      datetime.now(timezone.utc).isoformat()))
+        CON.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+# ---------- منع تكرار النشر ----------
+def norm_key(title: str) -> str:
+    """مفتاح مُطبَّع للعنوان: يكشف الخبر نفسه ولو جاء من موقع عربي آخر."""
+    s = re.sub(r"[ً-ْـ]", "", title or "")
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ى", "ي"), ("ة", "ه")):
+        s = s.replace(a, b)
+    s = re.sub(r"[^\w؀-ۿ ]+", " ", s).lower()
+    words = sorted({w for w in s.split() if len(w) > 2})[:8]
+    return " ".join(words)
+
+
+def mark_pushed(title: str, link: str) -> bool:
+    """True إذا كان الخبر جديدًا فعلاً، False إذا نُشر سابقًا."""
+    key = norm_key(title) or link
+    try:
+        CON.execute("INSERT INTO pushed VALUES (?,?)",
+                    (key, datetime.now(timezone.utc).isoformat()))
         CON.commit()
         return True
     except sqlite3.IntegrityError:
@@ -196,9 +241,13 @@ def collect_rss():
                 summary = re.sub(r"<[^>]+>", "", e.get("summary", ""))[:300]
                 if not title or not link:
                     continue
-                cat = classify(title + " " + summary)
-                if origin == "x" and cat is None:
+                blob = (title + " " + summary).lower()
+                if any(w in blob for w in BLOCK_WORDS):
                     continue
+                cat = classify(blob)
+                # المصادر كلها عربية ومتخصّصة بالكريبتو: أي خبر غير مصنّف = «عام»
+                if cat is None and origin == "news":
+                    cat = CAT_GENERAL
                 if cat is None:
                     continue
                 if save_news(link, title, source, origin, cat):
@@ -441,6 +490,9 @@ async def job_push(context: ContextTypes.DEFAULT_TYPE):
         return
     subs = CON.execute("SELECT chat_id, lang FROM subs").fetchall()
     for item in fresh[:8]:
+        # لا تُنشر خبرًا نُشر سابقًا (ولو ورد من مصدر عربي آخر برابط مختلف)
+        if not mark_pushed(item["title"], item["link"]):
+            continue
         for chat_id, lang in subs:
             lang = lang if lang in LANGS else DEFAULT_LANG
             title = await asyncio.to_thread(translate, item["title"], lang)
